@@ -7,17 +7,22 @@
   "github_repo": {
     "description": "博客仓库 owner/repo",
     "type": "string",
-    "default": "tianshihao2003/dumplingandcakeblog"
+    "default": "mengkuikun/Blog-2.0"
   },
   "github_branch": {
     "description": "目标分支",
     "type": "string",
     "default": "main"
   },
+  "blog_base_url": {
+    "description": "博客主页链接（用于在微信/QQ回显发布成功链接，如 https://imki.cn）",
+    "type": "string",
+    "default": "https://imki.cn"
+  },
   "imgbed_upload_url": {
     "description": "图床上传地址",
     "type": "string",
-    "default": "https://img.tsh520.cn/upload"
+    "default": "https://img.imki.cn/upload"
   },
   "imgbed_token": {
     "description": "图床 API_TOKEN",
@@ -77,12 +82,16 @@
   "moment_tags": {
     "description": "动态默认标签",
     "type": "list",
-    "default": ["日常"]
+    "default": [
+      "日常"
+    ]
   },
   "place_tags": {
     "description": "足迹默认标签",
     "type": "list",
-    "default": ["旅游"]
+    "default": [
+      "旅游"
+    ]
   },
   "default_note_dir": {
     "description": "笔记默认分类目录",
@@ -92,12 +101,14 @@
   "friend_default_avatar": {
     "description": "友链默认头像（未提供头像链接时使用）",
     "type": "string",
-    "default": "/assets/ziyuan/tx.webp"
+    "default": "/avatar.jpg"
   },
   "friend_tags": {
     "description": "友链默认标签",
     "type": "list",
-    "default": ["Blog"]
+    "default": [
+      "Blog"
+    ]
   },
   "allow_users": {
     "description": "允许使用的用户 ID 列表（个人微信为 wxid）；空列表 = 全部拒绝",
@@ -122,7 +133,9 @@
   "article_tags": {
     "description": "转载文章默认标签（/转载 生成的文章会带上）",
     "type": "list",
-    "default": ["转载"]
+    "default": [
+      "转载"
+    ]
   },
   "bill_default_account": {
     "description": "账单默认账户",

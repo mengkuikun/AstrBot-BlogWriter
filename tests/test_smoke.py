@@ -2,6 +2,7 @@
 """集成冒烟测试：stub 掉 astrbot 依赖与网络 IO，走完整命令链路。"""
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -157,6 +158,11 @@ class TestFlow(unittest.TestCase):
             async def _commit_md(self, path, md, now):
                 self.committed.append((path, md))
                 return True, path, ""
+
+            async def _commit_batch_md(self, files, message, now=None):
+                for path, md in files:
+                    self.committed.append((path, md))
+                return True, ""
 
             async def _album_index(self, repo, branch, token):
                 # 相册追加/新建分流用；默认空索引，各测试可覆盖 self.album_index_result
@@ -798,6 +804,16 @@ class TestBillSchedule(unittest.TestCase):
                 self.committed.append((path, md))
                 return True, path, ""
 
+            async def _commit_batch_md(self, files, message, now=None):
+                for path, md in files:
+                    self.committed.append((path, md))
+                self.batch_commits.append((files, message))
+                return True, ""
+
+            async def _commit_batch_delete(self, paths, message):
+                self.batch_deletes.append((paths, message))
+                return True, ""
+
             async def _album_index(self, repo, branch, token):
                 return self.album_index_result
 
@@ -807,11 +823,26 @@ class TestBillSchedule(unittest.TestCase):
             async def terminate(self):
                 pass
 
+        import tempfile
+        import shutil
+        self.tmpdir = tempfile.mkdtemp()
+
         self.plugin = Stubbed(context=types.SimpleNamespace(), config=dict(self.config))
         self.plugin.committed = []
+        self.plugin.batch_commits = []
+        self.plugin.batch_deletes = []
         self.plugin.scheduled = []
         self.plugin.last_upload_folder = None
         self.plugin.album_index_result = {"titles": {}, "files": {}}
+        self.plugin._pending_bills = {}
+        self.plugin._last_published = {}
+        self.plugin._pending_bills_file = Path(self.tmpdir) / "pending_bills.json"
+
+    def tearDown(self):
+        super().tearDown()
+        if hasattr(self, "tmpdir") and self.tmpdir:
+            import shutil
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def _send(self, text, messages=None, sender="u1"):
         ev = types.SimpleNamespace(
@@ -858,6 +889,20 @@ class TestBillSchedule(unittest.TestCase):
         self.assertEqual(sess.kind, "bill_batch")
         items = sess.meta.get("items")
         self.assertEqual(len(items), 3)
+
+    def test_publish_bill_batch(self):
+        replies = asyncio.get_event_loop().run_until_complete(self._send("/账单 午餐30晚餐45打车12"))
+        sess = self.plugin._sessions.get("u1")
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess.kind, "bill_batch")
+        self.assertEqual(len(sess.meta.get("items")), 3)
+        replies = asyncio.get_event_loop().run_until_complete(self._send("/发布"))
+        self.assertTrue(any("批量账单发布成功" in r for r in replies))
+        self.assertEqual(len(self.plugin.committed), 3)
+        self.assertEqual(len(self.plugin.batch_commits), 1)
+        files, msg = self.plugin.batch_commits[0]
+        self.assertEqual(len(files), 3)
+        self.assertIn("批量发布 3 笔账单", msg)
 
     def test_start_schedule_regex(self):
         replies = asyncio.get_event_loop().run_until_complete(self._send("/日程 明天下午3点高优在会议室A开周会 每周重复 提前15分钟"))
@@ -926,6 +971,10 @@ class TestBillSchedule(unittest.TestCase):
         replies = asyncio.get_event_loop().run_until_complete(self._send("/发布"))
         self.assertTrue(any("批量发布成功" in r for r in replies))
         self.assertEqual(len(self.plugin.committed), 3)
+        self.assertEqual(len(self.plugin.batch_commits), 1)
+        files, msg = self.plugin.batch_commits[0]
+        self.assertEqual(len(files), 3)
+        self.assertIn("批量发布 3 条日程", msg)
         first_path, first_md = self.plugin.committed[0]
         self.assertTrue(first_path.startswith("src/content/schedules/lunar-8-24-"))
         self.assertIn("isLunar: true", first_md)
@@ -951,7 +1000,7 @@ class TestBillSchedule(unittest.TestCase):
 
     def test_bill_session_modify_category_account(self):
         # 识别后 /发布 前可手动改分类与账户
-        asyncio.get_event_loop().run_until_complete(self._send("/账单 理发30"))
+        asyncio.get_event_loop().run_until_complete(self._send("/账单 测试30"))
         sess = self.plugin._sessions.get("u1")
         self.assertEqual(sess.meta.get("category"), "其他")
         replies = asyncio.get_event_loop().run_until_complete(self._send("分类: 人情收礼"))
@@ -964,6 +1013,91 @@ class TestBillSchedule(unittest.TestCase):
         replies = asyncio.get_event_loop().run_until_complete(self._send("分类: 水产"))
         self.assertTrue(any("已修改分类" in r for r in replies))
         self.assertEqual(sess.meta.get("category"), "水产")
+
+    def test_bill_backfill_path_uses_item_date(self):
+        # 补记历史账单：生成的 md 文件名必须以账单自身日期命名，而非当前 now 日期
+        asyncio.get_event_loop().run_until_complete(self._send("/账单 2026-10-08 午餐30"))
+        replies = asyncio.get_event_loop().run_until_complete(self._send("/发布"))
+        self.assertTrue(any("发布成功" in r for r in replies))
+        self.assertEqual(len(self.plugin.committed), 1)
+        path, md = self.plugin.committed[0]
+        self.assertEqual(path, "src/content/bills/2026-10-08-午餐.md")
+        self.assertIn("date: 2026-10-08", md)
+
+    def test_bill_in_session_modify_fields(self):
+        # 会话内修改日期、时间、金额、标题
+        asyncio.get_event_loop().run_until_complete(self._send("/账单 测试30"))
+        r1 = asyncio.get_event_loop().run_until_complete(self._send("日期: 2026-10-08"))
+        self.assertTrue(any("已修改日期" in r for r in r1))
+        r2 = asyncio.get_event_loop().run_until_complete(self._send("时间: 14:30"))
+        self.assertTrue(any("已修改时间" in r for r in r2))
+        r3 = asyncio.get_event_loop().run_until_complete(self._send("金额: 35"))
+        self.assertTrue(any("已修改金额" in r for r in r3))
+        r4 = asyncio.get_event_loop().run_until_complete(self._send("标题: 牛肉面"))
+        self.assertTrue(any("已修改标题" in r for r in r4))
+        replies = asyncio.get_event_loop().run_until_complete(self._send("/发布"))
+        self.assertTrue(any("发布成功" in r for r in replies))
+        path, md = self.plugin.committed[0]
+        self.assertEqual(path, "src/content/bills/2026-10-08-牛肉面.md")
+        self.assertIn("amount: -35", md)
+        self.assertIn('time: "14:30"', md)
+
+    def test_pending_bills_full_flow_and_recall(self):
+        # 待发暂存箱：/存账 随手存入（不占会话），/查存账 查看，/发布 合并单次 Commit，/撤回 10分钟内回滚
+        # 1. 存入第一笔（单条）
+        r1 = asyncio.get_event_loop().run_until_complete(self._send("/存账 绿茶3"))
+        self.assertTrue(any("已存入暂存箱" in r for r in r1))
+        self.assertIsNone(self.plugin._sessions.get("u1"))  # 零阻塞会话！
+        pending = self.plugin._pending_bills.get("u1", [])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["title"], "绿茶")
+
+        # 2. 存入第二笔（带历史日期）
+        r2 = asyncio.get_event_loop().run_until_complete(self._send("/存账 2026-10-08 奶茶18"))
+        self.assertTrue(any("已存入暂存箱" in r for r in r2))
+        self.assertEqual(len(self.plugin._pending_bills.get("u1")), 2)
+
+        # 3. 查存账
+        r3 = asyncio.get_event_loop().run_until_complete(self._send("/查存账"))
+        self.assertTrue(any("待发暂存箱清单" in r for r in r3))
+        self.assertTrue(any("绿茶" in r for r in r3))
+        self.assertTrue(any("奶茶" in r for r in r3))
+
+        # 4. 发布合并：无会话时发 /发布 自动合并暂存箱
+        r4 = asyncio.get_event_loop().run_until_complete(self._send("/发布"))
+        self.assertTrue(any("暂存箱发布成功" in r for r in r4))
+        self.assertEqual(len(self.plugin.batch_commits), 1)
+        files, msg = self.plugin.batch_commits[0]
+        self.assertEqual(len(files), 2)
+        # 验证第二笔文件名为 2026-10-08
+        self.assertTrue(any("2026-10-08-奶茶.md" in f[0] for f in files))
+        # 暂存箱已被清空
+        self.assertEqual(len(self.plugin._pending_bills.get("u1", [])), 0)
+
+        # 5. 发布后10分钟内发 /撤回 一键回滚
+        r5 = asyncio.get_event_loop().run_until_complete(self._send("/撤回"))
+        self.assertTrue(any("撤回成功" in r for r in r5))
+        self.assertEqual(len(self.plugin.batch_deletes), 1)
+        del_paths, del_msg = self.plugin.batch_deletes[0]
+        self.assertEqual(len(del_paths), 2)
+        # 撤回后账单自动恢复至暂存箱
+        self.assertEqual(len(self.plugin._pending_bills.get("u1", [])), 2)
+
+    def test_pending_bills_clear(self):
+        asyncio.get_event_loop().run_until_complete(self._send("/存账 绿茶3"))
+        self.assertEqual(len(self.plugin._pending_bills.get("u1", [])), 1)
+        replies = asyncio.get_event_loop().run_until_complete(self._send("/清存账"))
+        self.assertTrue(any("已清空待发暂存箱" in r for r in replies))
+        self.assertEqual(len(self.plugin._pending_bills.get("u1", [])), 0)
+
+    def test_recall_expired_rejected(self):
+        # 超过 10 分钟无法撤回
+        self.plugin._last_published["u1"] = {
+            "time": datetime(2026, 11, 9, 10, 0),
+            "paths": ["src/content/bills/old.md"],
+        }
+        replies = asyncio.get_event_loop().run_until_complete(self._send("/撤回"))
+        self.assertTrue(any("已超过撤回时限" in r for r in replies))
 
     def test_remind_command(self):
         replies = asyncio.get_event_loop().run_until_complete(self._send("/提醒"))
@@ -1947,5 +2081,171 @@ class TestArticleFlow(unittest.TestCase):
             self._restore(orig)
 
 
+class TestBatchCommitGitHub(unittest.TestCase):
+    """测试 main.py 中 _commit_batch_md 的 GitHub Git Data API 交互与排重逻辑"""
+
+    def setUp(self):
+        import main as plugin_main
+
+        self.plugin_main = plugin_main
+        self.config = {
+            "github_token": "mock-token",
+            "github_repo": "testowner/testrepo",
+            "github_branch": "main",
+            "allow_users": ["u1"],
+        }
+        self.plugin = plugin_main.BlogWriter(
+            context=types.SimpleNamespace(), config=dict(self.config)
+        )
+
+    def test_commit_batch_md_success_flow(self):
+        # 模拟 GitHub Git Data API 正常成功流程
+        reqs = []
+
+        class FakeResp:
+            def __init__(self, status_code, data):
+                self.status_code = status_code
+                self._data = data
+                self.text = json.dumps(data)
+
+            def json(self):
+                return self._data
+
+        class FakeClient:
+            async def get(self, url, headers=None):
+                reqs.append(("GET", url))
+                if "git/ref/heads/main" in url:
+                    return FakeResp(200, {"object": {"sha": "sha_commit_1"}})
+                if "git/commits/sha_commit_1" in url:
+                    return FakeResp(200, {"tree": {"sha": "sha_tree_1"}})
+                return FakeResp(404, {})
+
+            async def post(self, url, content=None, headers=None):
+                body = json.loads(content.decode("utf-8")) if content else {}
+                reqs.append(("POST", url, body))
+                if "git/trees" in url:
+                    return FakeResp(201, {"sha": "sha_tree_2"})
+                if "git/commits" in url:
+                    return FakeResp(201, {"sha": "sha_commit_2"})
+                return FakeResp(400, {})
+
+            async def patch(self, url, content=None, headers=None):
+                body = json.loads(content.decode("utf-8")) if content else {}
+                reqs.append(("PATCH", url, body))
+                if "git/refs/heads/main" in url:
+                    return FakeResp(200, {"object": {"sha": "sha_commit_2"}})
+                return FakeResp(400, {})
+
+        self.plugin._get_client = lambda: FakeClient()
+        self.plugin._github_exists = lambda repo, path, branch, token: asyncio.sleep(0, result=False)
+
+        files = [
+            ("src/content/bills/2026-10-11-午餐.md", "---\ntitle: 午餐\n---"),
+            ("src/content/bills/2026-10-11-打车.md", "---\ntitle: 打车\n---"),
+        ]
+        ok, err = asyncio.get_event_loop().run_until_complete(
+            self.plugin._commit_batch_md(files, "blog: 批量发布 2 笔账单")
+        )
+        self.assertTrue(ok, f"Failed with: {err}")
+        self.assertEqual(err, "")
+        # 验证调用链：GET ref -> GET commit -> POST tree -> POST commit -> PATCH ref
+        methods = [r[0] for r in reqs]
+        self.assertEqual(methods, ["GET", "GET", "POST", "POST", "PATCH"])
+        # 验证 POST tree 中包含了 2 个文件
+        tree_body = reqs[2][2]
+        self.assertEqual(tree_body["base_tree"], "sha_tree_1")
+        self.assertEqual(len(tree_body["tree"]), 2)
+        paths = [t["path"] for t in tree_body["tree"]]
+        self.assertEqual(paths, ["src/content/bills/2026-10-11-午餐.md", "src/content/bills/2026-10-11-打车.md"])
+
+    def test_commit_batch_md_intra_batch_dedup(self):
+        # 批次内同名防重：两个同名午餐，应自动分配为 午餐.md 与 午餐-1.md
+        post_trees = []
+
+        class FakeResp:
+            def __init__(self, status_code, data):
+                self.status_code = status_code
+                self._data = data
+                self.text = json.dumps(data)
+
+            def json(self):
+                return self._data
+
+        class FakeClient:
+            async def get(self, url, headers=None):
+                if "git/ref" in url:
+                    return FakeResp(200, {"object": {"sha": "c1"}})
+                return FakeResp(200, {"tree": {"sha": "t1"}})
+
+            async def post(self, url, content=None, headers=None):
+                if "git/trees" in url:
+                    post_trees.append(json.loads(content.decode("utf-8")))
+                    return FakeResp(201, {"sha": "t2"})
+                return FakeResp(201, {"sha": "c2"})
+
+            async def patch(self, url, content=None, headers=None):
+                return FakeResp(200, {"object": {"sha": "c2"}})
+
+        self.plugin._get_client = lambda: FakeClient()
+        self.plugin._github_exists = lambda repo, path, branch, token: asyncio.sleep(0, result=False)
+
+        files = [
+            ("src/content/bills/2026-10-11-午餐.md", "第一笔午餐"),
+            ("src/content/bills/2026-10-11-午餐.md", "第二笔午餐"),
+        ]
+        ok, err = asyncio.get_event_loop().run_until_complete(
+            self.plugin._commit_batch_md(files, "blog: 同名两笔")
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(post_trees), 1)
+        paths = [t["path"] for t in post_trees[0]["tree"]]
+        self.assertEqual(paths, ["src/content/bills/2026-10-11-午餐.md", "src/content/bills/2026-10-11-午餐-1.md"])
+
+    def test_commit_batch_md_conflict_retry(self):
+        patch_attempts = 0
+
+        class FakeResp:
+            def __init__(self, status_code, data):
+                self.status_code = status_code
+                self._data = data
+                self.text = json.dumps(data)
+
+            def json(self):
+                return self._data
+
+        class FakeClient:
+            async def get(self, url, headers=None):
+                if "git/ref" in url:
+                    return FakeResp(200, {"object": {"sha": "c1"}})
+                return FakeResp(200, {"tree": {"sha": "t1"}})
+
+            async def post(self, url, content=None, headers=None):
+                if "git/trees" in url:
+                    return FakeResp(201, {"sha": "t2"})
+                return FakeResp(201, {"sha": "c2"})
+
+            async def patch(self, url, content=None, headers=None):
+                nonlocal patch_attempts
+                patch_attempts += 1
+                if patch_attempts == 1:
+                    return FakeResp(409, {"message": "conflict"})
+                return FakeResp(200, {"object": {"sha": "c2"}})
+
+        self.plugin._get_client = lambda: FakeClient()
+        self.plugin._github_exists = lambda repo, path, branch, token: asyncio.sleep(0, result=False)
+        orig_delays = self.plugin_main.RETRY_DELAYS
+        self.plugin_main.RETRY_DELAYS = [0.001, 0.001]
+        try:
+            files = [("src/content/bills/2026-10-11-午餐.md", "午餐")]
+            ok, err = asyncio.get_event_loop().run_until_complete(
+                self.plugin._commit_batch_md(files, "blog: 冲突重试测试")
+            )
+            self.assertTrue(ok)
+            self.assertEqual(patch_attempts, 2)
+        finally:
+            self.plugin_main.RETRY_DELAYS = orig_delays
+
+
 if __name__ == "__main__":
     unittest.main()
+

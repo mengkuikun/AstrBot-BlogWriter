@@ -17,7 +17,16 @@ from blog_writer_core import (  # noqa: E402
     build_album_md,
     build_amap_url,
     build_bill_md,
+    build_github_commit_body,
+    build_github_delete_tree_body,
     build_github_put_body,
+    build_github_ref_update_body,
+    build_github_tree_body,
+    github_ref_url,
+    github_refs_url,
+    github_commit_url,
+    github_trees_url,
+    github_commits_url,
     build_imgbed_upload,
     build_moment_md,
     build_note_md,
@@ -36,6 +45,7 @@ from blog_writer_core import (  # noqa: E402
     parse_album_frontmatter,
     parse_amap_response,
     parse_bill,
+    parse_bills_batch,
     parse_dynamic,
     parse_friend_text,
     parse_github_put_response,
@@ -429,6 +439,53 @@ class TestRequests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("rate limited", err)
 
+    def test_github_git_data_api_helpers(self):
+        # 验证 URL 构造
+        self.assertEqual(
+            github_ref_url("owner/repo", "main"),
+            "https://api.github.com/repos/owner/repo/git/ref/heads/main",
+        )
+        self.assertEqual(
+            github_refs_url("owner/repo", "feat/test"),
+            "https://api.github.com/repos/owner/repo/git/refs/heads/feat/test",
+        )
+        self.assertEqual(
+            github_commit_url("owner/repo", "abc123sha"),
+            "https://api.github.com/repos/owner/repo/git/commits/abc123sha",
+        )
+        self.assertEqual(
+            github_trees_url("owner/repo"),
+            "https://api.github.com/repos/owner/repo/git/trees",
+        )
+        self.assertEqual(
+            github_commits_url("owner/repo"),
+            "https://api.github.com/repos/owner/repo/git/commits",
+        )
+
+        # 验证 tree body 构造
+        files = [
+            ("src/content/bills/2026-10-11-lunch.md", "---\ntitle: lunch\n---"),
+            ("src/content/bills/2026-10-11-dinner.md", "---\ntitle: dinner\n---"),
+        ]
+        tree_body = build_github_tree_body(files, base_tree="base_sha_123")
+        self.assertIn('"base_tree": "base_sha_123"', tree_body)
+        self.assertIn("src/content/bills/2026-10-11-lunch.md", tree_body)
+        self.assertIn("100644", tree_body)
+        self.assertIn("blob", tree_body)
+        self.assertIn("---\\ntitle: lunch\\n---", tree_body)
+
+        # 验证 commit body 构造
+        commit_body = build_github_commit_body("批量发布", "tree_sha_xyz", "parent_sha_uvw")
+        self.assertIn('"message": "\\u6279\\u91cf\\u53d1\\u5e03"', commit_body)
+        self.assertIn('"tree": "tree_sha_xyz"', commit_body)
+        self.assertIn('"parents": ["parent_sha_uvw"]', commit_body)
+
+        # 验证 ref update body 构造
+        ref_body = build_github_ref_update_body("new_commit_sha", force=False)
+        self.assertIn('"sha": "new_commit_sha"', ref_body)
+        self.assertIn('"force": false', ref_body)
+
+
 
 class TestSession(unittest.TestCase):
     def test_expiry(self):
@@ -694,6 +751,105 @@ class TestBillSchedule(unittest.TestCase):
         self.assertIn('title: "午餐"', md)
         self.assertIn("date: 2026-08-21", md)
         self.assertIn('tags: ["餐饮"]', md)
+
+    def test_bill_16_screenshot_cases(self):
+        # 严格验证来自真实微信截图的全部 16 笔被误判为「其他」的原始文本
+        cases = [
+            ("绿茶3", "食品酒水", 3),
+            ("雪糕5", "食品酒水", 5),
+            ("在美团买药买了感冒药和退烧药花了48块钱", "医疗健康", 48),
+            ("昨天晚上去网吧上网充值了50块钱", "游戏", 50),
+            ("昨天晚上跟朋友喝奶茶花了18块钱", "食品酒水", 18),
+            ("昨天下午买了两张电影票花了70块钱", "休闲娱乐", 70),
+            ("昨天在Steam买了一款游戏花了198块钱", "游戏", 198),
+            ("昨天去医院挂号看病花了65块钱", "医疗健康", 65),
+            ("昨天买了件短袖T恤花了89块钱", "居家生活", 89),
+            ("昨天晚上在便利店买了包烟花了25块钱微信", "食品酒水", 25),
+            ("昨天给家里猫咪买了包猫粮和猫罐头花了120块钱", "宠物", 120),
+            ("昨天下午去肯德基吃了份套餐38块钱花呗", "餐饮", 38),
+            ("昨天去屈臣氏买了瓶洗面奶和防晒霜花了85块钱", "居家生活", 85),
+            ("昨天晚上租了个共享充电宝花了6块钱微信", "居家生活", 6),
+            ("昨天买了本技术书籍花了59块钱", "居家生活", 59),
+            ("昨天买了两盒酸奶和一袋切片面包花了18块钱", "食品酒水", 18),
+        ]
+        for text, exp_cat, exp_amt in cases:
+            data, err = parse_bill(text)
+            self.assertEqual(err, "", f"Failed on {text}: {err}")
+            self.assertEqual(data["category"], exp_cat, f"Wrong category for {text}")
+            self.assertEqual(abs(data["amount"]), exp_amt, f"Wrong amount for {text}")
+
+    def test_bill_backfill_date_parsing(self):
+        # 补记日期提取：支持 YYYY-MM-DD、昨天、前天、大前天、10-08、10.8、10月8日
+        ref_now = datetime(2026, 11, 9, 12, 0, 0)
+        # 1. 明确标准年月日
+        data1, _ = parse_bill("2026-10-08 午餐30", ref_now)
+        self.assertEqual(data1["date"].strftime("%Y-%m-%d"), "2026-10-08")
+        self.assertEqual(abs(data1["amount"]), 30)
+
+        # 2. 昨天
+        data2, _ = parse_bill("昨天 午餐30", ref_now)
+        self.assertEqual(data2["date"].strftime("%Y-%m-%d"), "2026-11-08")
+        self.assertEqual(abs(data2["amount"]), 30)
+
+        # 3. 前天
+        data3, _ = parse_bill("前天 晚餐45", ref_now)
+        self.assertEqual(data3["date"].strftime("%Y-%m-%d"), "2026-11-07")
+
+        # 4. 大前天
+        data4, _ = parse_bill("大前天 打车20", ref_now)
+        self.assertEqual(data4["date"].strftime("%Y-%m-%d"), "2026-11-06")
+
+        # 5. 月日简写 10-08 与 10.8
+        data5, _ = parse_bill("10-08 午餐30", ref_now)
+        self.assertEqual(data5["date"].strftime("%Y-%m-%d"), "2026-10-08")
+
+        data6, _ = parse_bill("10.8 午餐30", ref_now)
+        self.assertEqual(data6["date"].strftime("%Y-%m-%d"), "2026-10-08")
+
+        # 6. 中文月日 10月8日
+        data7, _ = parse_bill("10月8日 电影票70", ref_now)
+        self.assertEqual(data7["date"].strftime("%Y-%m-%d"), "2026-10-08")
+
+        # 7. 纯金额不含日期（如 10.8元）不应被误判为 10月8日
+        data8, _ = parse_bill("午餐10.8元", ref_now)
+        self.assertEqual(data8["date"].strftime("%Y-%m-%d"), "2026-11-09")
+        self.assertEqual(data8["amount"], -10.8)
+
+    def test_batch_bill_global_date_inheritance(self):
+        # 批量账单全局首词日期继承：整批继承“昨天”，第二笔不回退今天
+        ref_now = datetime(2026, 11, 9, 12, 0, 0)
+        items, err = parse_bills_batch("昨天 午餐30 晚餐45 打车12", ref_now)
+        self.assertEqual(err, "")
+        self.assertEqual(len(items), 3)
+        for item in items:
+            self.assertEqual(item["date"].strftime("%Y-%m-%d"), "2026-11-08")
+        self.assertEqual(abs(items[0]["amount"]), 30)
+        self.assertEqual(abs(items[1]["amount"]), 45)
+        self.assertEqual(abs(items[2]["amount"]), 12)
+
+        # 单笔带日期不应被误拆成 4 笔
+        single, err = parse_bills_batch("2026-10-08 午餐30", ref_now)
+        self.assertEqual(err, "")
+        self.assertEqual(len(single), 1)
+        self.assertEqual(single[0]["title"], "午餐")
+        self.assertEqual(single[0]["date"].strftime("%Y-%m-%d"), "2026-10-08")
+
+        # 批量带完整日期前缀
+        batch2, err = parse_bills_batch("2026-10-08 午餐30 晚餐45 打车12", ref_now)
+        self.assertEqual(err, "")
+        self.assertEqual(len(batch2), 3)
+        for item in batch2:
+            self.assertEqual(item["date"].strftime("%Y-%m-%d"), "2026-10-08")
+
+    def test_build_github_delete_tree_body(self):
+        # build_github_delete_tree_body 产生带 sha: null 的 tree entries
+        body = build_github_delete_tree_body(["src/content/bills/2026-10-08-午餐.md"], "base123")
+        import json
+        data = json.loads(body)
+        self.assertEqual(data["base_tree"], "base123")
+        self.assertEqual(len(data["tree"]), 1)
+        self.assertEqual(data["tree"][0]["path"], "src/content/bills/2026-10-08-午餐.md")
+        self.assertIsNone(data["tree"][0]["sha"])
 
     def test_parse_schedule_natural(self):
         data, _ = parse_schedule("明天下午3点高优在会议室A开周会 每周重复 提前15分钟")

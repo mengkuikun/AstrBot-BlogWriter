@@ -22,9 +22,9 @@ def now_shanghai() -> datetime:
 SESSION_TIMEOUT = timedelta(minutes=30)
 MAX_PATH_SUFFIX = 10
 
-COMMANDS = ("动态", "笔记", "足迹", "友链", "相册", "账单", "日程", "生日", "纪念日", "影视", "书籍", "导航", "转载", "提醒", "发布", "取消", "状态", "帮助")
+COMMANDS = ("动态", "笔记", "足迹", "友链", "相册", "账单", "存账", "记一笔", "查存账", "清存账", "撤回", "撤销", "日程", "生日", "纪念日", "影视", "书籍", "导航", "转载", "提醒", "发布", "取消", "状态", "帮助")
 
-BILL_CATEGORIES = ["餐饮", "交通", "住房", "工资", "居家生活", "交流通讯", "食品酒水", "职业收入", "人情收礼", "还款", "其他"]
+BILL_CATEGORIES = ["餐饮", "交通", "住房", "工资", "居家生活", "交流通讯", "食品酒水", "职业收入", "人情收礼", "还款", "休闲娱乐", "游戏", "医疗健康", "宠物", "其他"]
 BILL_ACCOUNTS = ["微信", "支付宝", "银行卡", "现金", "其他"]
 SCHEDULE_PRIORITIES = ["none", "low", "medium", "high"]
 
@@ -363,6 +363,80 @@ def parse_github_put_response(status: int, body: str) -> Tuple[bool, str]:
     except (ValueError, AttributeError):
         msg = body[:200]
     return False, msg
+
+
+def github_ref_url(repo: str, branch: str) -> str:
+    return "https://api.github.com/repos/{}/git/ref/heads/{}".format(repo, _quote_path(branch))
+
+
+def github_refs_url(repo: str, branch: str) -> str:
+    return "https://api.github.com/repos/{}/git/refs/heads/{}".format(repo, _quote_path(branch))
+
+
+def github_commit_url(repo: str, commit_sha: str) -> str:
+    return "https://api.github.com/repos/{}/git/commits/{}".format(repo, _quote_path(commit_sha))
+
+
+def github_trees_url(repo: str) -> str:
+    return "https://api.github.com/repos/{}/git/trees".format(repo)
+
+
+def github_commits_url(repo: str) -> str:
+    return "https://api.github.com/repos/{}/git/commits".format(repo)
+
+
+def build_github_tree_body(files: List[Tuple[str, str]], base_tree: Optional[str] = None) -> str:
+    """构造 POST /git/trees 请求体。files 为 [(path, content_str), ...]"""
+    entries = []
+    for path, content in files:
+        entries.append(
+            {
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "content": content,
+            }
+        )
+    data = {"tree": entries}
+    if base_tree:
+        data["base_tree"] = base_tree
+    return json.dumps(data)
+
+
+def build_github_commit_body(message: str, tree_sha: str, parent_sha: Optional[str] = None) -> str:
+    """构造 POST /git/commits 请求体。"""
+    data = {
+        "message": message,
+        "tree": tree_sha,
+        "parents": [parent_sha] if parent_sha else [],
+    }
+    return json.dumps(data)
+
+
+def build_github_ref_update_body(commit_sha: str, force: bool = False) -> str:
+    """构造 PATCH /git/refs/heads/<branch> 请求体。"""
+    return json.dumps({"sha": commit_sha, "force": force})
+
+
+def build_github_delete_tree_body(paths: List[str], base_tree: Optional[str] = None) -> str:
+    """构造 POST /git/trees 请求体用于删除文件。
+    GitHub Git Data API 规范：设置 sha=None (JSON 序列化为 null) 通知 Git 从 base_tree 中删除该文件。
+    """
+    entries = []
+    for path in paths:
+        entries.append(
+            {
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": None,
+            }
+        )
+    data = {"tree": entries}
+    if base_tree:
+        data["base_tree"] = base_tree
+    return json.dumps(data)
+
 
 
 # ---------- 图床 ----------
@@ -1298,15 +1372,62 @@ class Session:
 
 # 分类关键词映射（用于白名单分类匹配）
 _BILL_CATEGORY_KEYWORDS: Dict[str, List[str]] = {
-    "餐饮": ["餐饮", "午餐", "晚餐", "早餐", "早饭", "午饭", "晚饭", "夜宵", "吃饭", "外卖", "食堂", "餐厅", "饮食", "聚餐"],
-    "交通": ["交通", "打车", "地铁", "公交", "出行", "机票", "火车", "高铁", "出租", "滴滴", "通勤", "车费", "路费"],
-    "住房": ["住房", "房租", "房贷", "物业", "水电", "房费", "住房"],
-    "工资": ["工资"],
-    "居家生活": ["居家", "家用", "日用", "家居", "生活费", "居家生活"],
-    "交流通讯": ["交流", "通讯", "话费", "流量", "宽带", "手机费"],
-    "食品酒水": ["食品", "酒水", "零食", "饮料", "酒", "水果", "买菜", "超市"],
-    "职业收入": ["职业收入", "奖金", "绩效", "提成", "收入", "兼职"],
-    "人情收礼": ["人情", "收礼", "红包", "礼金", "请客", "随礼", "送礼"],
+    "餐饮": [
+        "餐饮", "午餐", "晚餐", "早餐", "早饭", "午饭", "晚饭", "夜宵", "吃饭", "外卖", "食堂", "餐厅", "饮食", "聚餐",
+        "肯德基", "麦当劳", "汉堡", "套餐", "夜市", "火锅", "烧烤", "小吃", "炒面", "炒饭", "拉面", "米线", "螺蛳粉",
+        "黄焖鸡", "快餐", "便当", "料理", "披萨", "牛肉面", "麻辣烫", "堂食", "下馆子", "烤肉", "自助餐",
+    ],
+    "交通": [
+        "交通", "打车", "地铁", "公交", "出行", "机票", "火车", "高铁", "出租", "滴滴", "通勤", "车费", "路费",
+        "加油", "停车", "洗车", "修车", "过路费", "高速费", "共享单车", "单车", "电动车", "换零件", "保养",
+    ],
+    "住房": [
+        "住房", "房租", "房贷", "物业", "水电", "房费", "电费", "水费", "燃气费", "暖气费",
+    ],
+    "工资": [
+        "工资",
+    ],
+    "居家生活": [
+        "居家", "家用", "日用", "家居", "生活费", "居家生活",
+        "剪头发", "理发", "洗护", "洗发水", "沐浴露", "洗衣液", "抽纸", "洗洁精", "卫生纸",
+        "衣服", "裤子", "鞋子", "短袖", "T恤", "外套", "内衣", "袜子", "服饰",
+        "护肤", "洗面奶", "防晒霜", "化妆品", "屈臣氏", "面霜", "面膜",
+        "充电宝", "数据线", "电池", "排插", "五金", "工具",
+        "书籍", "买书", "图书", "教材", "书本",
+    ],
+    "交流通讯": [
+        "交流", "通讯", "话费", "流量", "宽带", "手机费", "充值卡",
+    ],
+    "食品酒水": [
+        "食品", "酒水", "零食", "饮料", "酒", "水果", "买菜", "超市",
+        "绿茶", "红茶", "乌龙茶", "奶茶", "咖啡", "果汁", "可乐", "雪碧", "矿泉水", "苏打水", "冰红茶",
+        "雪糕", "冰淇淋", "冰棒", "冰棍",
+        "酸奶", "牛奶", "面包", "吐司", "蛋糕", "饼干", "巧克力", "薯片", "坚果", "糖果",
+        "香烟", "包烟", "买烟", "抽烟", "卷烟", "烟",
+        "啤酒", "白酒", "红酒", "洋酒",
+        "西瓜", "草莓", "车厘子", "苹果", "香蕉", "葡萄", "水果店", "便利店",
+    ],
+    "职业收入": [
+        "职业收入", "奖金", "绩效", "提成", "收入", "兼职", "稿费", "劳务费", "分红",
+    ],
+    "人情收礼": [
+        "人情", "收礼", "红包", "礼金", "请客", "随礼", "送礼", "份子钱", "贺礼",
+    ],
+    "还款": [
+        "还款", "还信用卡", "还花呗", "还白条",
+    ],
+    "休闲娱乐": [
+        "娱乐", "休闲", "电影", "电影票", "看电影", "影院", "游乐园", "门票", "KTV", "密室", "剧本杀", "展览", "演唱会",
+    ],
+    "游戏": [
+        "游戏", "Steam", "网吧", "上网", "手游", "充值", "点券", "皮肤", "PlayStation", "PS5", "Switch", "Xbox", "任天堂",
+    ],
+    "医疗健康": [
+        "医疗", "医药", "买药", "看病", "挂号", "医院", "诊所", "药房", "药店", "感冒药", "退烧药", "消炎药", "止痛药", "体检", "就医",
+    ],
+    "宠物": [
+        "宠物", "猫粮", "狗粮", "猫咪", "小狗", "猫罐头", "狗罐头", "猫砂", "宠物医院", "猫条", "宠物店", "驱虫",
+    ],
     "其他": [],
 }
 
@@ -1330,36 +1451,77 @@ _BILL_TYPE_PREFIX = {
 
 
 def _parse_bill_date(text: str, now: datetime) -> datetime:
-    """从文本中提取日期关键词，返回对应的 datetime（00:00:00）"""
-    m = re.search(r"(今天|明天|昨天|后天|\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日)", text)
-    if not m:
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
-    token = m.group(1)
+    """从文本中提取日期关键词，返回对应的 datetime（00:00:00）。"""
     base = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if token == "今天":
-        return base
-    if token == "明天":
-        return base + timedelta(days=1)
-    if token == "昨天":
+    s = text or ""
+    # 1. 相对天数
+    if "大前天" in s:
+        return base - timedelta(days=3)
+    if "前天" in s:
+        return base - timedelta(days=2)
+    if "昨天" in s:
         return base - timedelta(days=1)
-    if token == "后天":
+    if "今天" in s:
+        return base
+    if "后天" in s:
         return base + timedelta(days=2)
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", token):
+    if "明天" in s:
+        return base + timedelta(days=1)
+
+    # 2. 完整年月日：2026-10-08 / 2026.10.08 / 2026/10/08 / 2026年10月8日
+    m_full = re.search(r"(\d{4})[年.\-/](\d{1,2})[月.\-/](\d{1,2})[日号]?", s)
+    if m_full:
         try:
-            dt = datetime.strptime(token, "%Y-%m-%d")
-            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            return datetime(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
         except ValueError:
-            return base
-    # m月d日
-    m2 = re.match(r"^(\d{1,2})月(\d{1,2})日$", token)
-    if m2:
+            pass
+
+    # 3. 月日：10月8日 / 10月8号 / 10月8
+    m_md = re.search(r"(\d{1,2})月(\d{1,2})[日号]?", s)
+    if m_md:
         try:
-            month = int(m2.group(1))
-            day = int(m2.group(2))
-            return datetime(now.year, month, day)
+            return datetime(now.year, int(m_md.group(1)), int(m_md.group(2)))
         except ValueError:
-            return base
+            pass
+
+    # 4. 开头简写月日（避免误判 10.8元 为日期，必须位于行首且后跟空格或结束）：10-08 / 10.8 / 10/8
+    m_short = re.search(r"^\s*(\d{1,2})[.\-/](\d{1,2})(?:\s+|$)", s)
+    if m_short:
+        try:
+            m = int(m_short.group(1))
+            d = int(m_short.group(2))
+            if 1 <= m <= 12 and 1 <= d <= 31:
+                return datetime(now.year, m, d)
+        except ValueError:
+            pass
+
+    # 5. 星期/周/礼拜
+    m_week = re.search(r"(上)?(?:周|星期|礼拜)([一二三四五六日天])", s)
+    if m_week:
+        is_last = bool(m_week.group(1))
+        w_map = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+        target_weekday = w_map.get(m_week.group(2))
+        if target_weekday is not None:
+            cur_weekday = base.weekday()
+            diff = cur_weekday - target_weekday
+            if diff <= 0:
+                diff += 7
+            if is_last:
+                diff += 7
+            return base - timedelta(days=diff)
+
     return base
+
+
+def _strip_bill_date(text: str) -> str:
+    """去除文本中的日期表达，避免干扰金额提取与标题生成。"""
+    t = text or ""
+    t = re.sub(r"\d{4}[年.\-/]\d{1,2}[月.\-/]\d{1,2}[日号]?", " ", t)
+    t = re.sub(r"\d{1,2}月\d{1,2}[日号]?", " ", t)
+    t = re.sub(r"^\s*\d{1,2}[.\-/]\d{1,2}(?:\s+|$)", " ", t)
+    t = re.sub(r"(大前天|前天|昨天|今天|后天|明天)", " ", t)
+    t = re.sub(r"(?:上)?(?:周|星期|礼拜)[一二三四五六日天]", " ", t)
+    return t
 
 
 # 时间表达：14:30 / 14：30 / 下午3点 / 3点半 / 12点30分 / 9点
@@ -1408,6 +1570,24 @@ def _detect_bill_category(text: str) -> str:
         for kw in keywords:
             if kw and kw in text:
                 return cat
+    # 词尾后缀智能兜底
+    clean_words = re.findall(r"[\u4e00-\u9fa5]{2,6}", text)
+    for w in clean_words:
+        if w.endswith(("茶", "咖", "水", "酒", "汁", "奶", "糕")):
+            if w not in ("薪水", "潜水", "试水", "水房", "跳水", "喝茶"):
+                return "食品酒水"
+        if w.endswith(("面", "粉", "饭", "餐", "肉", "菜", "羹", "粥", "饼")):
+            if w not in ("下半场", "开饭", "买菜"):
+                return "餐饮"
+        if w.endswith(("车", "票")):
+            if w not in ("水票", "门票", "发票", "退票", "彩票"):
+                return "交通"
+        if w.endswith(("药", "剂")):
+            if w not in ("农药", "炸药"):
+                return "医疗健康"
+        if w.endswith(("粮", "罐头", "猫条")):
+            if w not in ("粮食", "干粮"):
+                return "宠物"
     return "其他"
 
 
@@ -1428,42 +1608,52 @@ def parse_bills_batch(text: str, now=None) -> Tuple[List[Dict], str]:
     raw = (text or "").strip()
     if not raw:
         return [], "内容为空"
+
+    # 去掉日期和时间后检查有效金额数量（若只有1个或0个金额，直接走单条账单解析，避免如 2026-10-08 中的数字被拆成多笔）
+    clean_raw = _strip_bill_date(raw)
+    clean_raw = _BILL_TIME_RE.sub(" ", clean_raw)
+    clean_amounts = list(re.finditer(r"-?\d+(?:\.\d+)?\s*(?:块钱|元钱|块|元|￥)?", clean_raw))
+    if len(clean_amounts) <= 1:
+        data, err = parse_bill(raw, now)
+        return ([data] if data else []), err
+
+    # 检查整体文本头部是否有公共日期定义（如“昨天 午餐30 晚餐45” 或 “2026-10-08 午餐30 晚餐45”）
+    global_date = _parse_bill_date(raw, now)
+    base_now = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    has_global_date = (global_date != base_now)
+
+    # 去掉整体日期，避免日期里的数字在后续拆分时被误当成切片
+    content_to_split = _strip_bill_date(raw)
+
     # 按常见分隔符拆分：， 、 。 ； 换行 以及“和/与/ plus”
-    parts = re.split(r"[，。,；;、\n]+", raw)
+    parts = re.split(r"[，。,；;、\n]+", content_to_split)
     # 若只有一段但含多个金额，按金额切分
     expanded: List[str] = []
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        # 若一段含多个金额，按金额切（保留金额前的文本）
-        amounts = list(re.finditer(r"-?\d+(?:\.\d+)?\s*(?:块|元|￥)?", p))
+        # 若一段含多个金额，按金额切（每个条目取到该金额结束，最后一个金额取到剩余末尾）
+        amounts = list(re.finditer(r"-?\d+(?:\.\d+)?\s*(?:块钱|元钱|块|元|￥)?", p))
         if len(amounts) > 1:
-            # 按金额位置切分
             last = 0
             for idx, m in enumerate(amounts):
-                start = max(0, m.start() - 10)
-                # 向前找分隔
-                seg_start = last
-                if idx < len(amounts) - 1:
-                    seg_end = amounts[idx + 1].start()
-                    seg = p[seg_start:seg_end].strip(" ，,。")
+                if idx == len(amounts) - 1:
+                    seg = p[last:].strip(" ，,。 ")
                 else:
-                    seg = p[seg_start:].strip(" ，,。")
+                    seg = p[last:m.end()].strip(" ，,。 ")
                 if seg:
                     expanded.append(seg)
                 last = m.end()
-                # 下一次从金额后开始，避免重叠
-            # 若切分后仍只有1段，说明金额紧密，改按金额数量直接拆
             if len(expanded) <= 1:
                 expanded = [p]
         else:
             expanded.append(p)
     # 若拆分后仍只有1段但含多个金额，尝试按“和/与/，”再拆
-    if len(expanded) == 1 and len(re.findall(r"-?\d+(?:\.\d+)?\s*(?:块|元|￥)?", raw)) > 1:
+    if len(expanded) == 1 and len(re.findall(r"-?\d+(?:\.\d+)?\s*(?:块钱|元钱|块|元|￥)?", content_to_split)) > 1:
         # 按金额直接拆全文
         expanded = []
-        for m in re.finditer(r"([^，。,；;、\n]*?-?\d+(?:\.\d+)?\s*(?:块|元|￥)?[^，。,；;、\n]*)", raw):
+        for m in re.finditer(r"([^，。,；;、\n]*?-?\d+(?:\.\d+)?\s*(?:块钱|元钱|块|元|￥)?[^，。,；;、\n]*)", content_to_split):
             seg = m.group(1).strip(" ，,。")
             if seg:
                 expanded.append(seg)
@@ -1473,10 +1663,15 @@ def parse_bills_batch(text: str, now=None) -> Tuple[List[Dict], str]:
         if not seg:
             continue
         # 必须含金额才算一条账单
-        if not re.search(r"-?\d+(?:\.\d+)?\s*(?:块|元|￥)?", seg):
+        if not re.search(r"-?\d+(?:\.\d+)?\s*(?:块钱|元钱|块|元|￥)?", seg):
             continue
         data, err = parse_bill(seg, now)
         if data:
+            # 若单条未显式指定自身日期且整体有公共日期，则继承公共日期
+            if has_global_date:
+                seg_date = _parse_bill_date(seg, now)
+                if seg_date == base_now:
+                    data["date"] = global_date
             results.append(data)
     if not results:
         return [], "未识别到账单信息"
@@ -1486,7 +1681,7 @@ def parse_bills_batch(text: str, now=None) -> Tuple[List[Dict], str]:
 def parse_bill(text: str, now=None) -> Tuple[Optional[Dict], str]:
     """解析账单自然语言。返回 (data, err)，err 为空表示成功。
 
-    data 包含：title, amount, type(expense/income), category, account, date(datetime), description
+    data 包含：title, amount, type(expense/income), category, account, date(datetime), time(HH:mm), description
 
     类型判定（显式优先）：
     1. 首词为类型前缀（支出/消费/花费/收入/还款）+ 空格 → 显式指定
@@ -1522,8 +1717,18 @@ def parse_bill(text: str, now=None) -> Tuple[Optional[Dict], str]:
     if not raw:
         return None, "内容为空"
 
-    # 金额提取：(-?\d+(\.\d+)?)\s*(块|元|￥)?
-    m = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:块|元|￥)?", raw)
+    # 提取日期与时刻（在金额提取前解析，防止日期与时刻中的数字被误识别为金额）
+    date_val = _parse_bill_date(raw, now)
+    time_val = _parse_bill_time(raw, now) or now.strftime("%H:%M")
+
+    # 用于金额提取的文本：先剔除日期与时刻，防止 2026-10-08 中的 2026 或 12点 中的 12 被当作金额
+    text_for_amt = _strip_bill_date(raw)
+    text_for_amt = _BILL_TIME_RE.sub(" ", text_for_amt)
+
+    # 金额提取：优先匹配带货币单位（块钱/元钱/块/元/￥），其次匹配裸数字
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:块钱|元钱|块|元|￥)", text_for_amt)
+    if not m:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", text_for_amt)
     if not m:
         return None, "未识别到金额"
     try:
@@ -1562,26 +1767,31 @@ def parse_bill(text: str, now=None) -> Tuple[Optional[Dict], str]:
     else:
         category = _detect_bill_category(raw)
     account = _detect_bill_account(raw)
-    date_val = _parse_bill_date(raw, now)
-    # 时刻：显式时间词（下午3点/12点30/14:30）优先，否则记录当前时刻
-    time_val = _parse_bill_time(raw, now) or now.strftime("%H:%M")
 
     # 标题/描述提取：去除已知片段后剩余文本
     cleaned = raw
     # 去除日期词
-    cleaned = re.sub(r"(今天|明天|昨天|后天|\d{4}-\d{2}-\d{2}|\d{1,2}月\d{1,2}日)", "", cleaned)
+    cleaned = _strip_bill_date(cleaned)
     # 去除时间词（与 _BILL_TIME_RE 同口径，避免「12点」等混入标题）
     cleaned = _BILL_TIME_RE.sub(" ", cleaned)
-    # 去除账户
-    for acc in BILL_ACCOUNTS:
+    # 去除账户及账户别名
+    for acc in list(BILL_ACCOUNTS) + list(_BILL_ACCOUNT_ALIASES):
         cleaned = cleaned.replace(acc, "")
     # 去除金额（含可选单位）
-    cleaned = re.sub(r"(-?\d+(?:\.\d+)?)\s*(?:块|元|￥)?", "", cleaned)
+    cleaned = re.sub(r"(-?\d+(?:\.\d+)?)\s*(?:块钱|元钱|块|元|￥)?", "", cleaned)
+    cleaned = cleaned.replace("块钱", "").replace("元钱", "")
     # 去除类型动词（保留类别名词如 工资 餐饮 午餐 等，避免误删标题）
-    for kw in ["花了", "支出", "花费", "付款", "消费", "支付", "扣款"]:
+    for kw in ["花了", "支出", "花费", "付款", "消费", "支付", "扣款", "到账", "入账", "收款"]:
         cleaned = cleaned.replace(kw, "")
+    # 去除补记词
+    for kw in ["补记", "补发", "昨天的", "今天的", "前天的", "大前天的"]:
+        cleaned = cleaned.replace(kw, "")
+    cleaned = re.sub(r"^\s*补\s*", "", cleaned)
     # 单独的 "发" 常见于 "发工资"
     cleaned = re.sub(r"\b发\b", "", cleaned)
+    # 若包含独立“账单”字眼且有其他内容，清理“账单”
+    if len(cleaned.replace("账单", "").strip()) >= 2:
+        cleaned = cleaned.replace("账单", "")
     # 去除多余空白与标点
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，,。")
     cleaned = cleaned.strip()
@@ -1592,11 +1802,13 @@ def parse_bill(text: str, now=None) -> Tuple[Optional[Dict], str]:
         else:
             # 尝试从原文提取名词片段（去除数字与账户后的首个词）
             cleaned = raw
-            cleaned = re.sub(r"(-?\d+(?:\.\d+)?)\s*(?:块|元|￥)?", "", cleaned)
-            for acc in BILL_ACCOUNTS:
+            cleaned = _strip_bill_date(cleaned)
+            cleaned = _BILL_TIME_RE.sub(" ", cleaned)
+            cleaned = re.sub(r"(-?\d+(?:\.\d+)?)\s*(?:块钱|元钱|块|元|￥)?", "", cleaned)
+            cleaned = cleaned.replace("块钱", "").replace("元钱", "")
+            for acc in list(BILL_ACCOUNTS) + list(_BILL_ACCOUNT_ALIASES):
                 cleaned = cleaned.replace(acc, "")
-            cleaned = cleaned.replace("今天", "").replace("明天", "").replace("昨天", "").replace("后天", "")
-            for kw in ["花了", "支出", "花费", "付款", "消费", "支付", "扣款", "发"]:
+            for kw in ["花了", "支出", "花费", "付款", "消费", "支付", "扣款", "发", "补记", "补发"]:
                 cleaned = cleaned.replace(kw, "")
             cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，,。")
             if not cleaned:

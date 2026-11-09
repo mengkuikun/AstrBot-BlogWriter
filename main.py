@@ -24,7 +24,7 @@ import json
 import os
 import re
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -52,6 +52,7 @@ except ImportError:
     HAS_APSCHEDULER = False
 
 REMINDER_FILE = Path(__file__).parent / "data" / "schedules_reminder.json"
+PENDING_BILLS_FILE = Path(__file__).parent / "data" / "pending_bills.json"
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
@@ -80,7 +81,11 @@ try:
         build_tmdb_search_url,
         build_xxapi_ico_url,
         build_bill_md,
+        build_github_commit_body,
+        build_github_delete_tree_body,
         build_github_put_body,
+        build_github_ref_update_body,
+        build_github_tree_body,
         build_imgbed_upload,
         build_moment_md,
         build_note_md,
@@ -91,8 +96,15 @@ try:
         build_friend_md,
         clean_filename_part,
         extract_tags,
+        _parse_bill_date,
+        _parse_bill_time,
         github_base,
+        github_commit_url,
+        github_commits_url,
         github_put_url,
+        github_ref_url,
+        github_refs_url,
+        github_trees_url,
         moment_filename,
         next_friend_index,
         note_filename,
@@ -149,7 +161,11 @@ except ImportError:  # 兼容非包形式加载
         build_tmdb_search_url,
         build_xxapi_ico_url,
         build_bill_md,
+        build_github_commit_body,
+        build_github_delete_tree_body,
         build_github_put_body,
+        build_github_ref_update_body,
+        build_github_tree_body,
         build_imgbed_upload,
         build_moment_md,
         build_note_md,
@@ -160,8 +176,15 @@ except ImportError:  # 兼容非包形式加载
         build_friend_md,
         clean_filename_part,
         extract_tags,
+        _parse_bill_date,
+        _parse_bill_time,
         github_base,
+        github_commit_url,
+        github_commits_url,
         github_put_url,
+        github_ref_url,
+        github_refs_url,
+        github_trees_url,
         moment_filename,
         next_friend_index,
         note_filename,
@@ -225,6 +248,9 @@ class BlogWriter(Star):
         self._client = None
         self._reminders: List[Tuple[str, str, datetime]] = []
         self._reminder_file = self._resolve_reminder_file()
+        self._pending_bills_file = self._resolve_pending_bills_file()
+        self._pending_bills: Dict[str, List[Dict]] = self._load_pending_bills()
+        self._last_published: Dict[str, Dict[str, Any]] = {}
         self._loop = None
         try:
             self._loop = asyncio.get_running_loop()
@@ -288,6 +314,45 @@ class BlogWriter(Star):
             p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning("BlogWriter: 保存提醒文件失败: %s", e)
+
+    def _resolve_pending_bills_file(self) -> Path:
+        """待发暂存箱持久化路径。"""
+        try:
+            cwd = Path(os.getcwd())
+            if (cwd / "data" / "plugins").is_dir() or (cwd / "data" / "config").is_dir():
+                return cwd / "data" / "plugin_data" / "blog_writer" / "pending_bills.json"
+        except Exception as e:
+            logger.warning("BlogWriter: 解析待发暂存箱持久化路径失败，回退插件目录: %s", e)
+        return PENDING_BILLS_FILE
+
+    def _load_pending_bills(self) -> Dict[str, List[Dict]]:
+        pf = globals().get("PENDING_BILLS_FILE", PENDING_BILLS_FILE)
+        if pf != PENDING_BILLS_FILE:
+            paths = [pf]
+        else:
+            paths = [self._pending_bills_file, PENDING_BILLS_FILE]
+        for p in paths:
+            try:
+                if p.exists():
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        return raw
+            except Exception as e:
+                logger.warning("BlogWriter: 读取待发暂存箱失败: %s (%s)", e, p)
+        return {}
+
+    def _save_pending_bills(self) -> None:
+        try:
+            def _dt_serial(obj):
+                if isinstance(obj, (datetime, date)):
+                    return obj.strftime("%Y-%m-%d")
+                raise TypeError(f"Type {type(obj)} not serializable")
+
+            p = self._pending_bills_file
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(self._pending_bills, default=_dt_serial, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.error("BlogWriter: 保存待发暂存箱失败: %s", e)
 
     def _restore_reminders(self) -> None:
         if not hasattr(self, "_reminders"):
@@ -728,7 +793,9 @@ class BlogWriter(Star):
                 "账单会话已创建，请发送账单内容，发 /发布 提交，发 /取消 放弃。\n"
                 "支出：今天午餐微信花了32（或首词「支出」显式指定）\n"
                 "收入：发工资12000 银行卡（或首词「收入」）\n"
-                "批量：午餐30晚餐45打车12"
+                "补记：昨天 午餐30 或 10-08 午餐30\n"
+                "批量：午餐30晚餐45打车12\n"
+                "暂存：/存账 绿茶3（随手记不占会话，睡前 /发布 合并提交）"
             )
         # 批量正则（一句含多个金额，如“午餐30晚餐45打车12”）
         try:
@@ -769,6 +836,141 @@ class BlogWriter(Star):
                 item["priority"] = default_p
         if item.get("remind_before") is None:
             item["remind_before"] = self._cfg("schedule_remind_before", 10)
+
+    async def _handle_save_bill(self, event: AstrMessageEvent, user_id: str, args: List[str]):
+        text = " ".join(args).strip()
+        if not text:
+            return self._handle_list_pending_bills(event, user_id)
+
+        now = now_shanghai()
+        # 1. 批量解析（一句含多个金额）
+        items = []
+        try:
+            batch, _ = parse_bills_batch(text, now)
+            if batch and len(batch) > 1:
+                items = batch
+        except Exception:
+            pass
+
+        # 2. 单条解析
+        if not items:
+            parsed, err = parse_bill(text, now)
+            if parsed is None:
+                return event.plain_result(f"账单解析失败：{err}。格式参考：/存账 绿茶3 或 /存账 昨天 午餐30")
+            items = [parsed]
+
+        # 3. 应用默认值与规范化日期
+        for it in items:
+            self._apply_bill_defaults(it)
+            d = it.get("date")
+            if isinstance(d, datetime):
+                it["date"] = d.strftime("%Y-%m-%d")
+
+        # 4. 存入待发暂存箱
+        pending = self._pending_bills.setdefault(user_id, [])
+        pending.extend(items)
+        self._save_pending_bills()
+
+        # 5. 回复
+        total_exp = sum(abs(it.get("amount", 0)) for it in pending if it.get("type") == "expense")
+        total_inc = sum(abs(it.get("amount", 0)) for it in pending if it.get("type") == "income")
+        summary_parts = []
+        if total_exp > 0:
+            summary_parts.append(f"支出 ¥{total_exp:.2f}")
+        if total_inc > 0:
+            summary_parts.append(f"收入 ¥{total_inc:.2f}")
+        summary_str = "、".join(summary_parts) or "¥0.00"
+
+        if len(items) == 1:
+            it = items[0]
+            label = "支出" if it.get("type") == "expense" else "收入"
+            amt_str = f"{abs(it.get('amount', 0)):g}"
+            return event.plain_result(
+                f"📥 已存入暂存箱（第 {len(pending)} 笔）：\n"
+                f"📌 {it.get('title')}（{label} {amt_str} 元）\n"
+                f"🏷️ 分类：{it.get('category')} · 账户：{it.get('account')}\n"
+                f"📅 日期：{it.get('date')} {it.get('time', '')}\n\n"
+                f"💡 暂存箱共 {len(pending)} 笔（合计 {summary_str}）。\n"
+                f"随手记不占会话，随时发 /存账 继续添加，睡前发送 /发布 一次性合并提交！"
+            )
+        else:
+            titles = "、".join(f"{it.get('title')}{abs(it.get('amount', 0)):g}元" for it in items[:3])
+            more = f"等 {len(items)} 笔" if len(items) > 3 else ""
+            return event.plain_result(
+                f"📥 已存入暂存箱（本次存入 {len(items)} 笔）：\n"
+                f"📌 {titles}{more}\n\n"
+                f"💡 暂存箱共 {len(pending)} 笔（合计 {summary_str}）。\n"
+                f"发送 /查存账 查看清单，发送 /发布 一次性合并提交！"
+            )
+
+    def _handle_list_pending_bills(self, event: AstrMessageEvent, user_id: str):
+        pending = self._pending_bills.get(user_id) or []
+        if not pending:
+            return event.plain_result("📦 待发暂存箱是空的。\n发送 /存账 <内容>（如：/存账 绿茶3）即可随手暂存。")
+
+        lines = [f"📦 待发暂存箱清单（共 {len(pending)} 笔）："]
+        for idx, it in enumerate(pending, 1):
+            label = "-" if it.get("type") == "expense" else "+"
+            amt = abs(it.get("amount", 0))
+            lines.append(
+                f"{idx}. {it.get('title')} {label}{amt:g}元（{it.get('category')} · {it.get('account')} | {it.get('date')} {it.get('time', '')}）"
+            )
+
+        total_exp = sum(abs(it.get("amount", 0)) for it in pending if it.get("type") == "expense")
+        total_inc = sum(abs(it.get("amount", 0)) for it in pending if it.get("type") == "income")
+        stats = []
+        if total_exp > 0:
+            stats.append(f"支出 ¥{total_exp:.2f}")
+        if total_inc > 0:
+            stats.append(f"收入 ¥{total_inc:.2f}")
+        stats_str = "、".join(stats) or "¥0.00"
+
+        lines.append(f"\n📊 汇总：{stats_str}")
+        lines.append("💡 发送 /发布 即可打包为 1 个 Git Commit 提交到博客；发送 /清存账 可清空。")
+        return event.plain_result("\n".join(lines))
+
+    def _handle_clear_pending_bills(self, event: AstrMessageEvent, user_id: str):
+        pending = self._pending_bills.pop(user_id, [])
+        self._save_pending_bills()
+        if not pending:
+            return event.plain_result("待发暂存箱本来就是空的。")
+        return event.plain_result(f"🗑️ 已清空待发暂存箱（共清空 {len(pending)} 笔账单）。")
+
+    async def _handle_recall_last_publish(self, event: AstrMessageEvent, user_id: str):
+        rec = self._last_published.get(user_id)
+        if not rec:
+            return event.plain_result("⚠️ 最近没有可撤回的发布记录。")
+
+        now = now_shanghai()
+        pub_time = rec.get("time") or now
+        diff = (now - pub_time).total_seconds()
+        if diff > 600:
+            return event.plain_result("⏰ 已超过撤回时限（发布已超过 10 分钟），无法自动撤回。如需修改请直接前往博客仓库调整。")
+
+        paths = rec.get("paths") or []
+        if not paths:
+            self._last_published.pop(user_id, None)
+            return event.plain_result("未找到需要删除的文件记录。")
+
+        msg = f"blog: 通过 AstrBot 撤回最近发布的内容（共 {len(paths)} 个文件）"
+        ok, err = await self._commit_batch_delete(paths, msg)
+        if not ok:
+            return event.plain_result(f"撤回失败：{err}")
+
+        # 若是暂存箱发布的账单，自动恢复至暂存箱供修改
+        restored_hint = ""
+        items = rec.get("items")
+        if items:
+            pending = self._pending_bills.setdefault(user_id, [])
+            pending.extend(items)
+            self._save_pending_bills()
+            restored_hint = f"\n📦 已将撤回的 {len(items)} 笔账单恢复至暂存箱，发送 /查存账 可查看修改。"
+
+        self._last_published.pop(user_id, None)
+        path_list = "\n".join(f"- {p}" for p in paths)
+        return event.plain_result(
+            f"↩️ 撤回成功 ✅\n\n已从博客仓库中移除以下文件：\n{path_list}\n\nGit 提交已回滚，EdgeOne 正在重新部署。{restored_hint}"
+        )
 
     async def _start_schedule(self, event: AstrMessageEvent, user_id: str, args: List[str], raw: str):
         text = " ".join(args).strip()
@@ -924,7 +1126,7 @@ class BlogWriter(Star):
             icon_hint = "⚠ 图标获取失败（将无图标发布，不影响其他字段）"
         self._sessions[user_id] = session
         # 向导：选分类文件夹（博客导航分类=文件夹，如 学习网站/AI 工具/未分类）
-        repo = self._cfg("github_repo") or "tianshihao2003/dumplingandcakeblog"
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
         branch = self._cfg("github_branch") or "main"
         token = (self._cfg("github_token") or "").strip()
         folders = await self._list_daohang_folders(repo, branch, token)
@@ -1165,6 +1367,18 @@ class BlogWriter(Star):
             if cmd == "账单":
                 yield await self._start_bill(event, user_id, args, raw)
                 return
+            if cmd in ("存账", "记一笔"):
+                yield await self._handle_save_bill(event, user_id, args)
+                return
+            if cmd == "查存账":
+                yield self._handle_list_pending_bills(event, user_id)
+                return
+            if cmd == "清存账":
+                yield self._handle_clear_pending_bills(event, user_id)
+                return
+            if cmd in ("撤回", "撤销"):
+                yield await self._handle_recall_last_publish(event, user_id)
+                return
             if cmd == "日程":
                 yield await self._start_schedule(event, user_id, args, raw)
                 return
@@ -1329,36 +1543,72 @@ class BlogWriter(Star):
                             "相册只接收图片。请直接发图片，或发 /发布 提交、/取消 放弃。"
                         )
                     elif session.kind in ("bill", "bill_batch"):
-                        # 手动修改：分类:餐饮 / 账户:支付宝（识别错或不识别时纠正）
+                        # 手动修改：分类:餐饮 / 账户:支付宝 / 日期:2026-10-08 / 时间:14:30 / 金额:30 / 标题:午餐
                         m_cat = re.match(r"^(?:分类|类别|category)\s*[:：]?\s*(\S{1,10})\s*$", text)
                         m_acc = re.match(r"^(?:账户|账号|account)\s*[:：]?\s*(\S{1,10})\s*$", text)
-                        if m_cat or m_acc:
+                        m_date = re.match(r"^(?:日期|date)\s*[:：]?\s*(.+)$", text)
+                        m_time = re.match(r"^(?:时间|时刻|time)\s*[:：]?\s*(.+)$", text)
+                        m_amt = re.match(r"^(?:金额|多少钱|amount)\s*[:：]?\s*(-?\d+(?:\.\d+)?)\s*(?:块钱|元钱|块|元)?$", text)
+                        m_title = re.match(r"^(?:标题|备注|名称|title)\s*[:：]?\s*(.+)$", text)
+                        if m_cat or m_acc or m_date or m_time or m_amt or m_title:
                             if session.kind == "bill_batch":
-                                yield event.plain_result("批量账单暂不支持逐条修改，请发 /取消 后重新逐条记录。")
+                                yield event.plain_result("批量账单暂不支持逐条修改，请发 /取消 后重新记录。")
                                 return
                             if m_cat:
                                 cat = m_cat.group(1)
-                                # 自定义分类：白名单外直接接受（1-10 字已在正则限制）
                                 session.meta["category"] = cat
-                                session.touch()
-                                yield event.plain_result(
-                                    "已修改分类：{}。当前账单：{} 金额{}，分类{}，账户{}。发 /发布 提交。".format(
-                                        cat, session.meta.get("title"), session.meta.get("amount"),
-                                        session.meta.get("category"), session.meta.get("account"),
-                                    )
-                                )
-                                return
-                            if m_acc:
+                            elif m_acc:
                                 acc = m_acc.group(1)
                                 session.meta["account"] = acc
-                                session.touch()
-                                yield event.plain_result(
-                                    "已修改账户：{}。当前账单：{} 金额{}，分类{}，账户{}。发 /发布 提交。".format(
-                                        acc, session.meta.get("title"), session.meta.get("amount"),
-                                        session.meta.get("category"), session.meta.get("account"),
-                                    )
+                            elif m_date:
+                                dt = _parse_bill_date(m_date.group(1).strip(), now_shanghai())
+                                session.meta["date"] = dt
+                            elif m_time:
+                                tm = _parse_bill_time(m_time.group(1).strip(), now_shanghai())
+                                if tm:
+                                    session.meta["time"] = tm
+                            elif m_amt:
+                                val = float(m_amt.group(1))
+                                if session.meta.get("type") == "expense":
+                                    session.meta["amount"] = -abs(val)
+                                else:
+                                    session.meta["amount"] = abs(val)
+                            elif m_title:
+                                t = m_title.group(1).strip()
+                                session.meta["title"] = t
+                                session.meta["description"] = t
+
+                            session.touch()
+                            t_val = session.meta.get("type", "expense")
+                            l_val = "支出" if t_val == "expense" else "收入"
+                            d_val = session.meta.get("date")
+                            ds_val = d_val.strftime("%Y-%m-%d") if isinstance(d_val, datetime) else str(d_val)[:10]
+
+                            if m_cat:
+                                prefix = f"已修改分类：{session.meta['category']}。"
+                            elif m_acc:
+                                prefix = f"已修改账户：{session.meta['account']}。"
+                            elif m_date:
+                                prefix = f"已修改日期：{ds_val}。"
+                            elif m_time:
+                                prefix = f"已修改时间：{session.meta.get('time', '')}。"
+                            elif m_amt:
+                                prefix = f"已修改金额：{session.meta.get('amount')}。"
+                            elif m_title:
+                                prefix = f"已修改标题：{session.meta.get('title')}。"
+                            else:
+                                prefix = "已更新账单信息。"
+
+                            yield event.plain_result(
+                                "{}当前账单：{} 金额{}，分类{}，账户{}。发 /发布 提交。".format(
+                                    prefix,
+                                    session.meta.get("title"),
+                                    session.meta.get("amount"),
+                                    session.meta.get("category"),
+                                    session.meta.get("account"),
                                 )
-                                return
+                            )
+                            return
                         # 空会话后下一句口语：正则解析（支持批量）
                         try:
                             batch, _ = parse_bills_batch(text)
@@ -1564,7 +1814,7 @@ class BlogWriter(Star):
                     )
                 )
         # 空参进向导：先选笔记本
-        repo = self._cfg("github_repo") or "tianshihao2003/dumplingandcakeblog"
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
         branch = self._cfg("github_branch") or "main"
         token = (self._cfg("github_token") or "").strip()
         names = await self._list_notebook_names(repo, branch, token)
@@ -1629,7 +1879,7 @@ class BlogWriter(Star):
                 "相册「{}」已创建。\n\n请直接发图片（可多发），发完说 /发布。".format(name)
             )
         # 空参进向导：列出现有相册（一次拉取，排序后同时生成展示与映射，保证选项不错位）
-        repo = self._cfg("github_repo") or "tianshihao2003/dumplingandcakeblog"
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
         branch = self._cfg("github_branch") or "main"
         token = (self._cfg("github_token") or "").strip()
         idx = await self._album_index(repo, branch, token)
@@ -1744,18 +1994,76 @@ class BlogWriter(Star):
         if not ok:
             return event.plain_result("转载提交失败：{}".format(err2))
         slug = final_path[len("src/content/posts/"):-len(".md")]
+        blog_base = (self._cfg("blog_base_url") or "https://imki.cn").rstrip("/")
         return event.plain_result(
-            "转载成功 ✅\n\n标题：{}\n公众号：{}\n文件：{}\n博客：https://blog.tsh520.cn/posts/{}".format(
-                data["title"], data["author"] or "未知", final_path, slug)
+            "转载成功 ✅\n\n标题：{}\n公众号：{}\n文件：{}\n博客：{}/posts/{}".format(
+                data["title"], data["author"] or "未知", final_path, blog_base, slug
+            )
         )
 
     # ---------- 发布 ----------
 
+    async def _publish_pending_bills(self, event: AstrMessageEvent, user_id: str) -> MessageEventResult:
+        pending = self._pending_bills.get(user_id) or []
+        if not pending:
+            return event.plain_result("待发暂存箱为空，无法发布。")
+
+        now = now_shanghai()
+        raw_files: List[Tuple[str, str]] = []
+        for item in pending:
+            try:
+                md_item = build_bill_md(item, now)
+                title_item = str(item.get("title") or "账单").strip() or "账单"
+                slug_item = clean_filename_part(title_item)
+                date_val = item.get("date") or now
+                if isinstance(date_val, datetime):
+                    date_str = date_val.strftime("%Y-%m-%d")
+                else:
+                    date_str = str(date_val).strip()[:10] or now.strftime("%Y-%m-%d")
+                path_item = "src/content/bills/{}-{}.md".format(date_str, slug_item)
+                raw_files.append((path_item, md_item))
+            except Exception as e:
+                return event.plain_result(f"暂存账单「{item.get('title', '?')}」生成失败：{e}，发布已中止。")
+
+        commit_msg = f"blog: 通过 AstrBot 暂存箱合并发布 {len(raw_files)} 笔账单"
+        ok, err = await self._commit_batch_md(raw_files, commit_msg, now)
+        if not ok:
+            return event.plain_result(f"暂存箱合并发布失败：{err}（数据仍安全保留在暂存箱中，请重试）")
+
+        published_items = self._pending_bills.pop(user_id, [])
+        self._save_pending_bills()
+        self._last_published[user_id] = {
+            "time": now,
+            "paths": [f[0] for f in raw_files],
+            "items": published_items,
+            "kind": "bill_pending",
+        }
+
+        total_exp = sum(abs(it.get("amount", 0)) for it in published_items if it.get("type") == "expense")
+        total_inc = sum(abs(it.get("amount", 0)) for it in published_items if it.get("type") == "income")
+        stats = []
+        if total_exp > 0:
+            stats.append(f"支出 ¥{total_exp:.2f}")
+        if total_inc > 0:
+            stats.append(f"收入 ¥{total_inc:.2f}")
+        stats_str = "、".join(stats) or "¥0.00"
+
+        blog_base = (self._cfg("blog_base_url") or "https://imki.cn").rstrip("/")
+        return event.plain_result(
+            f"🎉 暂存箱发布成功 ✅\n\n"
+            f"共 {len(raw_files)} 笔账单已合并为 1 个 Git Commit 写入博客，仅触发 1 次部署！\n"
+            f"📊 汇总：{stats_str}\n"
+            f"🌐 博客流水：{blog_base}/bills\n\n"
+            f"（💡 如发现记错，可于 10 分钟内发送 /撤回 一键回滚）"
+        )
+
     async def _publish(self, event: AstrMessageEvent, user_id: str) -> MessageEventResult:
         session = self._session(user_id)
         if not session:
+            if self._pending_bills.get(user_id):
+                return await self._publish_pending_bills(event, user_id)
             return event.plain_result("当前没有进行中的会话，请先发 /动态、/笔记、/足迹、/友链、/相册、/账单 或 /日程。")
-        repo = self._cfg("github_repo") or "tianshihao2003/dumplingandcakeblog"
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
         branch = self._cfg("github_branch") or "main"
         token = (self._cfg("github_token") or "").strip()
         album_folder = None
@@ -1948,31 +2256,44 @@ class BlogWriter(Star):
                 md = build_bill_md(session.meta, now)
                 title = str(session.meta.get("title") or "账单").strip() or "账单"
                 slug = clean_filename_part(title)
-                path = "src/content/bills/{}-{}.md".format(now.strftime("%Y-%m-%d"), slug)
+                date_val = session.meta.get("date") or now
+                if isinstance(date_val, datetime):
+                    date_str = date_val.strftime("%Y-%m-%d")
+                else:
+                    date_str = str(date_val).strip()[:10] or now.strftime("%Y-%m-%d")
+                path = "src/content/bills/{}-{}.md".format(date_str, slug)
                 link = "/bills/{}".format(slug)
             elif session.kind == "bill_batch":
                 items = session.meta.get("items") or []
                 if not items:
                     return event.plain_result("批量账单为空，无法发布。")
-                success = 0
-                fails = []
+                raw_files: List[Tuple[str, str]] = []
                 for item in items:
                     try:
                         md_item = build_bill_md(item, now)
                         title_item = str(item.get("title") or "账单").strip() or "账单"
                         slug_item = clean_filename_part(title_item)
-                        path_item = "src/content/bills/{}-{}.md".format(now.strftime("%Y-%m-%d"), slug_item)
-                        ok_item, final_item, err_item = await self._commit_md(path_item, md_item, now)
-                        if ok_item:
-                            success += 1
+                        date_val = item.get("date") or now
+                        if isinstance(date_val, datetime):
+                            date_str = date_val.strftime("%Y-%m-%d")
                         else:
-                            fails.append(f"{title_item}:{err_item}")
+                            date_str = str(date_val).strip()[:10] or now.strftime("%Y-%m-%d")
+                        path_item = "src/content/bills/{}-{}.md".format(date_str, slug_item)
+                        raw_files.append((path_item, md_item))
                     except Exception as e:
-                        fails.append(f"{item.get('title','?')}:{e}")
+                        return event.plain_result(f"账单「{item.get('title', '?')}」生成失败：{e}，批量发布已中止。")
+                commit_msg = f"blog: 通过 AstrBot 批量发布 {len(raw_files)} 笔账单"
+                ok, err = await self._commit_batch_md(raw_files, commit_msg, now)
                 self._sessions.pop(user_id, None)
-                if fails:
-                    return event.plain_result(f"批量账单发布完成：成功{success}条，失败{len(fails)}条：{'; '.join(fails[:3])}")
-                return event.plain_result(f"批量账单发布成功 ✅ 共{success}条，已写入 bills。")
+                if not ok:
+                    return event.plain_result(f"批量账单发布失败：{err}")
+                self._last_published[user_id] = {
+                    "time": now,
+                    "paths": [f[0] for f in raw_files],
+                    "items": items,
+                    "kind": "bill_batch",
+                }
+                return event.plain_result(f"批量账单发布成功 ✅ 共{len(raw_files)}条，已写入 bills。（如需撤回可于10分钟内发 /撤回）")
             elif session.kind in ("schedule", "birthday", "anniversary"):
                 if not session.meta or not session.meta.get("title"):
                     return event.plain_result("日程/生日/纪念日信息不完整，请先发送内容（如：明天下午3点在会议室A开周会 / 我的农历8.24 / 结婚纪念日 农历5月20）。")
@@ -1986,52 +2307,55 @@ class BlogWriter(Star):
                 items = session.meta.get("items") or []
                 if not items:
                     return event.plain_result("批量日程为空，无法发布。")
-                # 批量创建：逐个生成并提交
-                success = 0
-                fails = []
+                raw_files = []
                 for item in items:
                     try:
                         md_item = build_schedule_md(item, now)
                         title_item = str(item.get("title") or "日程").strip() or "日程"
                         slug_item = clean_filename_part(title_item)
                         path_item = "src/content/schedules/{}-{}.md".format(schedule_filename(item, now), slug_item)
-                        ok_item, final_item, err_item = await self._commit_md(path_item, md_item, now)
-                        if ok_item:
-                            success += 1
-                            # 若为生日则无需提醒；若含时间则调度
-                            try:
-                                date_val = item.get("date")
-                                dt = date_val if isinstance(date_val, datetime) else None
-                                if isinstance(date_val, str):
-                                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                                        try:
-                                            dt = datetime.strptime(date_val.strip(), fmt)
-                                            break
-                                        except ValueError:
-                                            continue
-                                if dt and not item.get("allDay", True):
-                                    all_day = item.get("allDay")
-                                    if all_day is None:
-                                        all_day = dt.hour == 0 and dt.minute == 0
-                                    if not all_day:
-                                        remind_before = item.get("remind_before", self._cfg("schedule_remind_before", 10))
-                                        try:
-                                            remind_before = int(remind_before)
-                                        except Exception:
-                                            remind_before = 10
-                                        remind_at = dt - timedelta(minutes=remind_before) if remind_before > 0 else dt
-                                        origin = getattr(event, "unified_msg_origin", "") or getattr(event, "session_id", "") or user_id
-                                        self._schedule_remind(user_id, title_item, remind_at, origin, remind_before)
-                            except Exception:
-                                pass
-                        else:
-                            fails.append(f"{title_item}:{err_item}")
+                        raw_files.append((path_item, md_item))
                     except Exception as e:
-                        fails.append(f"{item.get('title','?')}:{e}")
+                        return event.plain_result(f"日程「{item.get('title', '?')}」生成失败：{e}，批量发布已中止。")
+                commit_msg = f"blog: 通过 AstrBot 批量发布 {len(raw_files)} 条日程"
+                ok, err = await self._commit_batch_md(raw_files, commit_msg, now)
                 self._sessions.pop(user_id, None)
-                if fails:
-                    return event.plain_result(f"批量发布完成：成功{success}条，失败{len(fails)}条：{'; '.join(fails[:3])}")
-                return event.plain_result(f"批量发布成功 ✅ 共{success}条，已写入 schedules。")
+                self._last_published[user_id] = {
+                    "time": now,
+                    "paths": [f[0] for f in raw_files],
+                    "kind": "schedule_batch",
+                }
+                if not ok:
+                    return event.plain_result(f"批量日程发布失败：{err}")
+                # 提交成功后统一调度提醒
+                for item in items:
+                    try:
+                        date_val = item.get("date")
+                        dt = date_val if isinstance(date_val, datetime) else None
+                        if isinstance(date_val, str):
+                            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                                try:
+                                    dt = datetime.strptime(date_val.strip(), fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                        if dt and not item.get("allDay", True):
+                            all_day = item.get("allDay")
+                            if all_day is None:
+                                all_day = dt.hour == 0 and dt.minute == 0
+                            if not all_day:
+                                remind_before = item.get("remind_before", self._cfg("schedule_remind_before", 10))
+                                try:
+                                    remind_before = int(remind_before)
+                                except Exception:
+                                    remind_before = 10
+                                remind_at = dt - timedelta(minutes=remind_before) if remind_before > 0 else dt
+                                origin = getattr(event, "unified_msg_origin", "") or getattr(event, "session_id", "") or user_id
+                                title_item = str(item.get("title") or "日程").strip() or "日程"
+                                self._schedule_remind(user_id, title_item, remind_at, origin, remind_before)
+                    except Exception:
+                        pass
+                return event.plain_result(f"批量发布成功 ✅ 共{len(raw_files)}条，已写入 schedules。")
             else:
                 lat, lng = await self._geocode(
                     session.meta.get("province", "") + session.meta.get("city", "")
@@ -2102,11 +2426,18 @@ class BlogWriter(Star):
                 logger.warning("BlogWriter: 调度提醒异常: %s", e)
 
         self._sessions.pop(user_id, None)
+        self._last_published[user_id] = {
+            "time": now,
+            "paths": [final_path],
+            "kind": session.kind,
+        }
         created_hint = "\n🎉 已新建笔记本「{}」（含 _index.json）".format(
             clean_filename_part(session.meta.get("note_dir") or "日常随笔", fallback="日常随笔")
         ) if session.kind == "note" and index_created else ""
+        blog_base = (self._cfg("blog_base_url") or "https://imki.cn").rstrip("/")
+        recall_hint = "\n（💡 如需撤回，可于 10 分钟内发送 /撤回）" if session.kind in ("bill", "moment", "note") else ""
         return event.plain_result(
-            "发布成功 ✅\n\n文件：{}\n博客：https://blog.tsh520.cn{}{}".format(final_path, link, created_hint)
+            "发布成功 ✅\n\n文件：{}\n博客：{}{}{}".format(final_path, blog_base + link, created_hint, recall_hint)
         )
 
     # ---------- 图片/视频 ----------
@@ -2213,7 +2544,7 @@ class BlogWriter(Star):
         return [r for r in results if r is not None]
 
     async def _imgbed_upload(self, filename: str, data: bytes, folder: str = "") -> Tuple[bool, str]:
-        upload_url = (self._cfg("imgbed_upload_url") or "https://img.tsh520.cn/upload").strip()
+        upload_url = (self._cfg("imgbed_upload_url") or "https://img.imki.cn/upload").strip()
         token = (self._cfg("imgbed_token") or "").strip()
         base_host = upload_base_host(upload_url)
         req_data = build_imgbed_upload(upload_url, filename, data)
@@ -2262,7 +2593,7 @@ class BlogWriter(Star):
     # ---------- GitHub ----------
 
     async def _commit_md(self, path: str, md: str, now: datetime) -> Tuple[bool, str, str]:
-        repo = self._cfg("github_repo") or "tianshihao2003/dumplingandcakeblog"
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
         branch = self._cfg("github_branch") or "main"
         token = (self._cfg("github_token") or "").strip()
         base_name = path.rsplit(".", 1)[0]
@@ -2280,6 +2611,234 @@ class BlogWriter(Star):
                 return False, "", err
             return True, candidate, ""
         return False, "", "文件名冲突过多，无法找到可用文件名"
+
+    async def _commit_batch_md(
+        self, files: List[Tuple[str, str]], message: str, now: Optional[datetime] = None
+    ) -> Tuple[bool, str]:
+        """批量提交多个 Markdown 文件，整合为单次 Git Commit，触发单次 EdgeOne 构建部署。
+        使用 GitHub Git Data API (Tree + Commit + Ref)。
+        files 列表为 [(base_path, md_content), ...]
+        """
+        if not files:
+            return True, ""
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
+        branch = self._cfg("github_branch") or "main"
+        token = (self._cfg("github_token") or "").strip()
+
+        # 1. 批量文件名冲突解决（支持批次内同名防重与远端防重）
+        allocated_paths = set()
+        resolved_files: List[Tuple[str, str]] = []
+        for base_path, md_content in files:
+            base_name = base_path.rsplit(".", 1)[0]
+            assigned_path = None
+            for index in range(11):
+                candidate = with_suffix(base_name, ".md", index)
+                if candidate in allocated_paths:
+                    continue
+                exists = await self._github_exists(repo, candidate, branch, token)
+                if exists is None:
+                    return False, "GitHub 查询失败（网络或 Token 问题）"
+                if exists:
+                    continue
+                assigned_path = candidate
+                allocated_paths.add(candidate)
+                break
+            if not assigned_path:
+                return False, f"文件名冲突过多：{base_path}"
+            resolved_files.append((assigned_path, md_content))
+
+        # 2. 调用 GitHub Git Data API 完成单次 Commit
+        headers = {
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        }
+        client = self._get_client()
+
+        for attempt in range(RETRY_COUNT + 1):
+            try:
+                # 获取分支最新 commit sha
+                ref_url = github_ref_url(repo, branch)
+                resp_ref = await client.get(ref_url, headers=headers)
+                if resp_ref.status_code != 200:
+                    logger.warning("BlogWriter 批量提交获取 ref 失败 HTTP %s: %s", resp_ref.status_code, resp_ref.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"获取分支引用失败 (HTTP {resp_ref.status_code})"
+                ref_data = resp_ref.json()
+                latest_commit_sha = ref_data.get("object", {}).get("sha")
+                if not latest_commit_sha:
+                    return False, "分支引用未包含 commit sha"
+
+                # 获取该 commit 对应的 base_tree sha
+                commit_url = github_commit_url(repo, latest_commit_sha)
+                resp_commit = await client.get(commit_url, headers=headers)
+                if resp_commit.status_code != 200:
+                    logger.warning("BlogWriter 批量提交获取 commit 失败 HTTP %s: %s", resp_commit.status_code, resp_commit.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"获取父提交失败 (HTTP {resp_commit.status_code})"
+                base_tree_sha = resp_commit.json().get("tree", {}).get("sha")
+                if not base_tree_sha:
+                    return False, "父提交未包含 tree sha"
+
+                # 创建新 tree（包含批量所有文件变更）
+                trees_url = github_trees_url(repo)
+                tree_body = build_github_tree_body(resolved_files, base_tree=base_tree_sha)
+                resp_tree = await client.post(trees_url, content=tree_body.encode("utf-8"), headers=headers)
+                if resp_tree.status_code not in (200, 201):
+                    logger.warning("BlogWriter 批量提交创建 tree 失败 HTTP %s: %s", resp_tree.status_code, resp_tree.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"创建 Git Tree 失败 (HTTP {resp_tree.status_code})"
+                new_tree_sha = resp_tree.json().get("sha")
+                if not new_tree_sha:
+                    return False, "新 Tree 未返回 sha"
+
+                # 创建新 commit
+                commits_url = github_commits_url(repo)
+                commit_body = build_github_commit_body(message, new_tree_sha, latest_commit_sha)
+                resp_new_commit = await client.post(commits_url, content=commit_body.encode("utf-8"), headers=headers)
+                if resp_new_commit.status_code not in (200, 201):
+                    logger.warning("BlogWriter 批量提交创建 commit 失败 HTTP %s: %s", resp_new_commit.status_code, resp_new_commit.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"创建 Git Commit 失败 (HTTP {resp_new_commit.status_code})"
+                new_commit_sha = resp_new_commit.json().get("sha")
+                if not new_commit_sha:
+                    return False, "新 Commit 未返回 sha"
+
+                # 更新分支 ref (PATCH)
+                refs_url = github_refs_url(repo, branch)
+                ref_update_body = build_github_ref_update_body(new_commit_sha, force=False)
+                resp_update = await client.patch(refs_url, content=ref_update_body.encode("utf-8"), headers=headers)
+                if resp_update.status_code in (409, 422):
+                    logger.warning("BlogWriter 批量提交更新 ref 并发冲突，第 %s 次重试", attempt + 1)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, "更新分支引用并发冲突"
+                if resp_update.status_code not in (200, 201):
+                    logger.warning("BlogWriter 批量提交更新 ref 失败 HTTP %s: %s", resp_update.status_code, resp_update.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"更新分支引用失败 (HTTP {resp_update.status_code})"
+
+                return True, ""
+            except Exception as e:
+                logger.warning("BlogWriter 批量提交异常 (第%s次): %s", attempt + 1, e)
+                if attempt < RETRY_COUNT:
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+
+        return False, "GitHub 批量提交网络错误"
+
+    async def _commit_batch_delete(self, paths: List[str], message: str) -> Tuple[bool, str]:
+        """批量删除 GitHub 上的文件，整合为单次 Git Commit，触发单次 EdgeOne 部署。"""
+        if not paths:
+            return True, ""
+        repo = self._cfg("github_repo") or "mengkuikun/Blog-2.0"
+        branch = self._cfg("github_branch") or "main"
+        token = (self._cfg("github_token") or "").strip()
+        if not token:
+            return False, "未配置 github_token"
+
+        headers = {
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        }
+        client = self._get_client()
+
+        for attempt in range(RETRY_COUNT + 1):
+            try:
+                # 获取分支最新 commit sha
+                ref_url = github_ref_url(repo, branch)
+                resp_ref = await client.get(ref_url, headers=headers)
+                if resp_ref.status_code != 200:
+                    logger.warning("BlogWriter 批量删除获取 ref 失败 HTTP %s: %s", resp_ref.status_code, resp_ref.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"获取分支引用失败 (HTTP {resp_ref.status_code})"
+                ref_data = resp_ref.json()
+                latest_commit_sha = ref_data.get("object", {}).get("sha")
+                if not latest_commit_sha:
+                    return False, "分支引用未包含 commit sha"
+
+                # 获取该 commit 对应的 base_tree sha
+                commit_url = github_commit_url(repo, latest_commit_sha)
+                resp_commit = await client.get(commit_url, headers=headers)
+                if resp_commit.status_code != 200:
+                    logger.warning("BlogWriter 批量删除获取 commit 失败 HTTP %s: %s", resp_commit.status_code, resp_commit.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"获取父提交失败 (HTTP {resp_commit.status_code})"
+                base_tree_sha = resp_commit.json().get("tree", {}).get("sha")
+                if not base_tree_sha:
+                    return False, "父提交未包含 tree sha"
+
+                # 创建新 tree (sha: None 告知 Git 删除指定路径)
+                trees_url = github_trees_url(repo)
+                tree_body = build_github_delete_tree_body(paths, base_tree=base_tree_sha)
+                resp_tree = await client.post(trees_url, content=tree_body.encode("utf-8"), headers=headers)
+                if resp_tree.status_code not in (200, 201):
+                    logger.warning("BlogWriter 批量删除创建 tree 失败 HTTP %s: %s", resp_tree.status_code, resp_tree.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"创建 Git Tree (删除) 失败 (HTTP {resp_tree.status_code})"
+                new_tree_sha = resp_tree.json().get("sha")
+                if not new_tree_sha:
+                    return False, "新 Tree 未返回 sha"
+
+                # 创建新 commit
+                commits_url = github_commits_url(repo)
+                commit_body = build_github_commit_body(message, new_tree_sha, latest_commit_sha)
+                resp_new_commit = await client.post(commits_url, content=commit_body.encode("utf-8"), headers=headers)
+                if resp_new_commit.status_code not in (200, 201):
+                    logger.warning("BlogWriter 批量删除创建 commit 失败 HTTP %s: %s", resp_new_commit.status_code, resp_new_commit.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"创建 Git Commit 失败 (HTTP {resp_new_commit.status_code})"
+                new_commit_sha = resp_new_commit.json().get("sha")
+                if not new_commit_sha:
+                    return False, "新 Commit 未返回 sha"
+
+                # 更新分支 ref (PATCH)
+                refs_url = github_refs_url(repo, branch)
+                ref_update_body = build_github_ref_update_body(new_commit_sha, force=False)
+                resp_update = await client.patch(refs_url, content=ref_update_body.encode("utf-8"), headers=headers)
+                if resp_update.status_code in (409, 422):
+                    logger.warning("BlogWriter 批量删除更新 ref 并发冲突，第 %s 次重试", attempt + 1)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, "更新分支引用并发冲突"
+                if resp_update.status_code not in (200, 201):
+                    logger.warning("BlogWriter 批量删除更新 ref 失败 HTTP %s: %s", resp_update.status_code, resp_update.text)
+                    if attempt < RETRY_COUNT:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, f"更新分支引用失败 (HTTP {resp_update.status_code})"
+
+                return True, ""
+            except Exception as e:
+                logger.warning("BlogWriter 批量删除异常 (第%s次): %s", attempt + 1, e)
+                if attempt < RETRY_COUNT:
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    continue
+                return False, f"批量删除异常: {e}"
+        return False, "批量删除超出最大重试次数"
+
 
     async def _github_exists(self, repo: str, path: str, branch: str, token: str) -> Optional[bool]:
         url = github_base(repo, path, branch)
@@ -2731,22 +3290,56 @@ class BlogWriter(Star):
 
         # ---- 账单向导 ----
         if step == "bill_confirm_type":
-            # 兼容旧路径：会话内发 "分类:xxx / 账户:xxx" 直接修改（向导中也放行）
+            # 兼容修改：分类:xxx / 账户:xxx / 日期:xxx / 时间:xxx / 金额:xxx / 标题:xxx
             m_cat_early = re.match(r"^(?:分类|类别|category)\s*[:：]?\s*(\S{1,10})\s*$", text)
             m_acc_early = re.match(r"^(?:账户|账号|account)\s*[:：]?\s*(\S{1,10})\s*$", text)
-            if m_cat_early:
-                cat = m_cat_early.group(1)
-                # 自定义分类：白名单外直接接受（1-10 字已在正则限制）
-                sess.meta["category"] = cat
+            m_date_early = re.match(r"^(?:日期|date)\s*[:：]?\s*(.+)$", text)
+            m_time_early = re.match(r"^(?:时间|时刻|time)\s*[:：]?\s*(.+)$", text)
+            m_amt_early = re.match(r"^(?:金额|多少钱|amount)\s*[:：]?\s*(-?\d+(?:\.\d+)?)\s*(?:块钱|元钱|块|元)?$", text)
+            m_title_early = re.match(r"^(?:标题|备注|名称|title)\s*[:：]?\s*(.+)$", text)
+            if m_cat_early or m_acc_early or m_date_early or m_time_early or m_amt_early or m_title_early:
+                if m_cat_early:
+                    sess.meta["category"] = m_cat_early.group(1)
+                elif m_acc_early:
+                    sess.meta["account"] = m_acc_early.group(1)
+                elif m_date_early:
+                    sess.meta["date"] = _parse_bill_date(m_date_early.group(1).strip(), now_shanghai())
+                elif m_time_early:
+                    tm = _parse_bill_time(m_time_early.group(1).strip(), now_shanghai())
+                    if tm:
+                        sess.meta["time"] = tm
+                elif m_amt_early:
+                    val = float(m_amt_early.group(1))
+                    if sess.meta.get("type") == "expense":
+                        sess.meta["amount"] = -abs(val)
+                    else:
+                        sess.meta["amount"] = abs(val)
+                elif m_title_early:
+                    t = m_title_early.group(1).strip()
+                    sess.meta["title"] = t
+                    sess.meta["description"] = t
                 sess.touch()
-                return event.plain_result("已修改分类：{}。当前账单：{} 金额{}，分类{}，账户{}。发 /发布 提交。".format(
-                    cat, sess.meta.get("title"), sess.meta.get("amount"), sess.meta.get("category"), sess.meta.get("account")))
-            if m_acc_early:
-                acc = m_acc_early.group(1)
-                sess.meta["account"] = acc
-                sess.touch()
-                return event.plain_result("已修改账户：{}。当前账单：{} 金额{}，分类{}，账户{}。发 /发布 提交。".format(
-                    acc, sess.meta.get("title"), sess.meta.get("amount"), sess.meta.get("category"), sess.meta.get("account")))
+                d_val = sess.meta.get("date")
+                ds_val = d_val.strftime("%Y-%m-%d") if isinstance(d_val, datetime) else str(d_val)[:10]
+                if m_cat_early:
+                    prefix = f"已修改分类：{sess.meta['category']}。"
+                elif m_acc_early:
+                    prefix = f"已修改账户：{sess.meta['account']}。"
+                elif m_date_early:
+                    prefix = f"已修改日期：{ds_val}。"
+                elif m_time_early:
+                    prefix = f"已修改时间：{sess.meta.get('time', '')}。"
+                elif m_amt_early:
+                    prefix = f"已修改金额：{sess.meta.get('amount')}。"
+                elif m_title_early:
+                    prefix = f"已修改标题：{sess.meta.get('title')}。"
+                else:
+                    prefix = "已更新账单信息。"
+                return event.plain_result(
+                    "{}当前账单：{} 金额{}，分类{}，账户{}。发 /发布 提交。".format(
+                        prefix, sess.meta.get("title"), sess.meta.get("amount"), sess.meta.get("category"), sess.meta.get("account")
+                    )
+                )
             choice = parse_choice(text, 4)
             if choice is not None:
                 if choice == 3:  # 直接发布
@@ -2901,7 +3494,13 @@ class BlogWriter(Star):
             "\n"
             "———— 💰 记生活 ————\n"
             "/账单 午餐微信花了32\n"
+            "　支持补记：/账单 昨天 午餐30 或 10-08 午餐30\n"
             "　确认类型后发布；分类账户已识别则免问\n"
+            "/存账 绿茶3（或 /记一笔）\n"
+            "　随手存入待发暂存箱，睡前发 /发布 一次性提交\n"
+            "/查存账　查看待发暂存箱\n"
+            "/清存账　清空待发暂存箱\n"
+            "/撤回　发布后10分钟内一键回滚\n"
             "/日程 明天3点在A开会 每周\n"
             "　支持优先级、提前15分钟提醒\n"
             "/生日 我的农历8.24\n"
